@@ -1,0 +1,514 @@
+# fab_monitor_gui.py
+# Real-time fab monitor: multiple product lines, parameter spec checks, live chart
+# Requirements: PySimpleGUI, openpyxl, matplotlib
+
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from queue import Queue, Empty
+from collections import deque
+
+import PySimpleGUI as sg
+from openpyxl import load_workbook
+
+# Matplotlib (embed into PySimpleGUI's Tk canvas)
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
+
+# ------------------------- Config / Utilities ------------------------- #
+HIST_LEN = 300           # samples kept per target for plotting
+HEADER_SCAN_ROWS = 5     # scan first N rows to find header row/column name
+
+
+@dataclass(frozen=True)
+class Spec:
+    product: str
+    param: str         # column header to watch (e.g., "Vt")
+    lsl: float | None  # lower spec limit (nullable)
+    usl: float | None  # upper spec limit (nullable)
+
+
+def try_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def in_spec(v, lsl, usl):
+    if v is None:
+        return None
+    if lsl is not None and v < lsl:
+        return False
+    if usl is not None and v > usl:
+        return False
+    return True
+
+
+# ------------------------- Worker (one per file/spec) ------------------------- #
+class TargetWorker(threading.Thread):
+    """
+    Polls an Excel file/sheet every `interval` seconds.
+    Extracts the latest numeric value of a given parameter column (by header),
+    computes PASS/FAIL vs LSL/USL, and emits status dicts into a shared Queue.
+    Also tracks row growth (Growing/No change/Stalled/Decreased).
+    """
+    def __init__(self, path, sheet, spec: Spec, interval=10, stall_threshold=2, outq=None):
+        super().__init__(daemon=True)
+        self.path = str(Path(path))
+        self.sheet = sheet or ""     # "" => first sheet
+        self.spec = spec
+        self.interval = max(1, int(interval))
+        self.stall_threshold = max(1, int(stall_threshold))
+        self.outq = outq or Queue()
+        self._stop = threading.Event()
+
+        self._last_rows = None
+        self._stalled = 0
+
+        # header resolution cache
+        self._col_idx = None
+        self._header_row = None
+
+        # KPI counters
+        self._n_total = 0
+        self._n_pass = 0
+
+    def stop(self): self._stop.set()
+
+    def update_policy(self, interval=None, stall_threshold=None):
+        if interval is not None:
+            self.interval = max(1, int(interval))
+        if stall_threshold is not None:
+            self.stall_threshold = max(1, int(stall_threshold))
+
+    def _open_ws(self):
+        wb = load_workbook(filename=self.path, read_only=True, data_only=True)
+        ws = wb[self.sheet] if self.sheet else wb[wb.sheetnames[0]]
+        return wb, ws
+
+    def _resolve_header(self, ws):
+        """
+        Find the header row and target column index by header name (case-insensitive).
+        Scans first HEADER_SCAN_ROWS rows; if not found, assumes row 1 is headers.
+        """
+        target = (self.spec.param or "").strip().lower()
+        if not target:
+            return 1, None  # no param given → caller can handle (will emit error)
+
+        for r in range(1, HEADER_SCAN_ROWS + 1):
+            row = [str(ws.cell(r, c).value).strip() if ws.cell(r, c).value is not None else ""
+                   for c in range(1, ws.max_column + 1)]
+            # quick match
+            for c, name in enumerate(row, start=1):
+                if name.lower() == target:
+                    return r, c
+        # fallback: assume row 1 headers
+        hdr_row = 1
+        for c in range(1, ws.max_column + 1):
+            name = ws.cell(hdr_row, c).value
+            if isinstance(name, str) and name.strip().lower() == target:
+                return hdr_row, c
+        return hdr_row, None
+
+    def _latest_numeric_from_col(self, ws, header_row, col_idx):
+        """
+        From the bottom up, find the latest non-empty numeric value in the column.
+        """
+        max_r = ws.max_row or header_row
+        r = max_r
+        while r > header_row:
+            v = ws.cell(r, col_idx).value
+            f = try_float(v)
+            if f is not None:
+                return int(max_r), f  # rows count (max_r) and latest value
+            r -= 1
+        return int(max_r), None
+
+    def _emit(self, **kw):
+        kw.setdefault("file", self.path)
+        kw.setdefault("sheet", self.sheet if self.sheet else "(first sheet)")
+        kw.setdefault("product", self.spec.product)
+        kw.setdefault("param", self.spec.param)
+        kw.setdefault("ts", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        self.outq.put(kw)
+
+    def run(self):
+        self._emit(status="Added", rows=0, value=None, in_spec=None,
+                   pass_rate=None, error="")
+
+        while not self._stop.is_set():
+            try:
+                if not Path(self.path).exists():
+                    raise FileNotFoundError("File not found")
+
+                wb, ws = self._open_ws()
+
+                # Resolve header/column once (or retry if not found yet)
+                if self._col_idx is None:
+                    hdr_row, col_idx = self._resolve_header(ws)
+                    self._header_row, self._col_idx = hdr_row, col_idx
+
+                # row growth status
+                rows = int(ws.max_row or 0)
+                if self._last_rows is None:
+                    growth_tag = "Initializing"
+                    self._stalled = 0
+                else:
+                    if rows > self._last_rows:
+                        growth_tag = "Growing"
+                        self._stalled = 0
+                    elif rows == self._last_rows:
+                        self._stalled += 1
+                        growth_tag = "Stalled" if self._stalled >= self.stall_threshold else "No change"
+                    else:
+                        growth_tag = "Decreased"
+                self._last_rows = rows
+
+                # Extract latest value
+                value = None
+                if self._col_idx is None:
+                    raise ValueError(f"Parameter header '{self.spec.param}' not found in first {HEADER_SCAN_ROWS} rows")
+                header_row = self._header_row or 1
+                _, value = self._latest_numeric_from_col(ws, header_row, self._col_idx)
+
+                wb.close()
+
+                # Evaluate spec
+                inside = in_spec(value, self.spec.lsl, self.spec.usl)
+                if inside is not None:
+                    self._n_total += 1
+                    if inside: self._n_pass += 1
+                    pass_rate = round(100.0 * self._n_pass / max(1, self._n_total), 2)
+                else:
+                    pass_rate = None
+
+                self._emit(status=growth_tag,
+                           rows=rows,
+                           value=value,
+                           in_spec=inside,
+                           pass_rate=pass_rate,
+                           error="")
+
+            except Exception as e:
+                self._emit(status="Error",
+                           rows=None,
+                           value=None,
+                           in_spec=None,
+                           pass_rate=None,
+                           error=str(e))
+
+            # Responsive sleep
+            for _ in range(max(1, self.interval) * 10):
+                if self._stop.is_set(): break
+                time.sleep(0.1)
+
+
+# ------------------------- Monitor (manages workers) -------------------------- #
+class ParallelFabMonitor:
+    def __init__(self, interval=10, stall_threshold=2):
+        self.interval = max(1, int(interval))
+        self.stall_threshold = max(1, int(stall_threshold))
+        self.outq = Queue()
+        self._workers = {}  # key: (path, sheet, product, param) -> worker
+
+    @staticmethod
+    def _key(path, sheet, spec: Spec):
+        return (str(Path(path)), sheet or "", spec.product, spec.param)
+
+    def add(self, path, sheet, spec: Spec):
+        key = self._key(path, sheet, spec)
+        if key in self._workers: return False
+        w = TargetWorker(
+            path=key[0], sheet=key[1],
+            spec=spec, interval=self.interval,
+            stall_threshold=self.stall_threshold, outq=self.outq
+        )
+        self._workers[key] = w
+        w.start()
+        return True
+
+    def remove(self, key):
+        w = self._workers.pop(key, None)
+        if w:
+            w.stop()
+            self.outq.put({
+                "file": key[0],
+                "sheet": key[1] if key[1] else "(first sheet)",
+                "product": key[2],
+                "param": key[3],
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "Removed",
+                "rows": "",
+                "value": "",
+                "in_spec": "",
+                "pass_rate": "",
+                "error": ""
+            })
+            return True
+        return False
+
+    def apply_policy(self, interval, stall_threshold):
+        self.interval = max(1, int(interval))
+        self.stall_threshold = max(1, int(stall_threshold))
+        for w in self._workers.values():
+            w.update_policy(self.interval, self.stall_threshold)
+
+    def drain(self):
+        items = []
+        try:
+            while True:
+                items.append(self.outq.get_nowait())
+        except Empty:
+            pass
+        return items
+
+
+# ------------------------- Plot helper (keeps canvas packed) ------------------ #
+def make_draw_plot():
+    fig_agg = {"obj": None}
+    def draw_plot(canvas_elem, ys):
+        canvas = canvas_elem.TKCanvas
+        if fig_agg["obj"] is not None:
+            try: fig_agg["obj"].get_tk_widget().destroy()
+            except: pass
+            fig_agg["obj"] = None
+
+        fig = Figure(figsize=(5.2, 3.7), dpi=100)
+        ax = fig.add_subplot(111)
+        if ys:
+            xs = list(range(1, len(ys)+1))
+            if len(ys) == 1:
+                ax.scatter(xs, ys)
+            else:
+                ax.plot(xs, ys)
+            ymin, ymax = min(ys), max(ys)
+            if ymin == ymax: ymin -= 1; ymax += 1
+            ax.set_ylim(ymin, ymax)
+            ax.set_xlabel("Sample #")
+            ax.set_ylabel("Value")
+            ax.grid(True, alpha=0.3)
+        else:
+            ax.text(0.5, 0.5, "No data yet", ha="center", va="center", transform=ax.transAxes)
+            ax.set_xticks([]); ax.set_yticks([])
+        fig.tight_layout()
+        agg = FigureCanvasTkAgg(fig, master=canvas)
+        agg.draw()
+        agg.get_tk_widget().pack(fill="both", expand=1)
+        fig_agg["obj"] = agg
+    return draw_plot
+
+
+# ------------------------------- GUI Front Panel ------------------------------ #
+def main():
+    sg.theme("SystemDefault")
+
+    # Table columns
+    headings = ["Product", "Param", "LSL", "USL", "File", "Sheet", "Value", "InSpec", "Pass %", "Rows", "Status", "Last Update", "Note / Error"]
+
+    mon = ParallelFabMonitor(interval=10, stall_threshold=2)
+
+    left_col = [
+        [sg.Text("Monitoring interval (s)"),
+         sg.Input("10", size=(6,1), key="-INTERVAL-"),
+         sg.Text("Stall threshold"),
+         sg.Input("2", size=(4,1), key="-STALL-"),
+         sg.Button("Apply", key="-APPLY-")],
+
+        [sg.Text("Product"), sg.Input(key="-PRODUCT-", size=(14,1)),
+         sg.Text("Param header"), sg.Input(key="-PARAM-", size=(16,1)),
+         sg.Text("LSL"), sg.Input(key="-LSL-", size=(6,1)),
+         sg.Text("USL"), sg.Input(key="-USL-", size=(6,1))],
+
+        [sg.Text("Add Excel:"),
+         sg.Input(key="-FILE-", expand_x=True,
+                  tooltip="Type or browse one/more paths; separated by ; or new lines"),
+         sg.FilesBrowse(key="-BROWSE-",
+                        file_types=(("Excel", "*.xlsx *.xlsm *.xls"),)),
+         sg.Text("Sheet"),
+         sg.Input(key="-SHEET-", size=(14,1)),
+         sg.Button("Add", key="-ADD-")],
+
+        [sg.Table(values=[],
+                  headings=headings,
+                  key="-TABLE-",
+                  expand_x=True, expand_y=True,
+                  auto_size_columns=True, justification="left",
+                  select_mode=sg.TABLE_SELECT_MODE_BROWSE,
+                  enable_events=True, enable_click_events=True,
+                  right_click_selects=True, num_rows=16)],
+
+        [sg.Button("Remove Selected", key="-REMOVE-")]
+    ]
+
+    right_col = [
+        [sg.Text("Parameter History (selected row)", font=("Segoe UI", 12, "bold"))],
+        [sg.Canvas(key="-PLOT-", size=(520, 380))]
+    ]
+
+    layout = [
+        [sg.Column(left_col, expand_x=True, expand_y=True),
+         sg.VSeperator(),
+         sg.Column(right_col, pad=(8,4), expand_y=True)],
+        [sg.Button("Exit")]
+    ]
+
+    window = sg.Window("Fab Real-Time Monitor (Multi-Line, Spec Checks)",
+                       layout, finalize=True, resizable=True)
+
+    # State
+    rows_map = {}                    # row_idx -> key
+    latest_state = {}                # key -> last message dict
+    history = {}                     # key -> deque[float]
+    selected_key = None
+
+    draw_plot = make_draw_plot()
+    draw_plot(window["-PLOT-"], [])
+
+    def rebuild_table():
+        nonlocal rows_map, selected_key
+        rows = []
+        rows_map = {}
+        for i, (key, msg) in enumerate(sorted(latest_state.items(), key=lambda x: x[0])):
+            path, sheet, product, param = key
+            lsl = msg.get("lsl") if "lsl" in msg else None
+            usl = msg.get("usl") if "usl" in msg else None
+            # we also propagate LSL/USL in msg during add; if absent, use GUI inputs at add time
+            rows.append([
+                product,
+                param,
+                msg.get("lsl", ""), msg.get("usl", ""),
+                path,
+                sheet if sheet else "(first sheet)",
+                "" if msg.get("value") is None else msg.get("value"),
+                "" if msg.get("in_spec") is None else ("PASS" if msg["in_spec"] else "FAIL"),
+                "" if msg.get("pass_rate") is None else msg["pass_rate"],
+                "" if msg.get("rows") is None else msg["rows"],
+                msg.get("status",""),
+                msg.get("ts",""),
+                msg.get("error","")
+            ])
+            rows_map[i] = key
+        window["-TABLE-"].update(values=rows)
+
+        # Auto-select first row
+        if rows and selected_key is None:
+            window["-TABLE-"].update(select_rows=[0])
+            selected_key = rows_map.get(0)
+            ys = list(history.get(selected_key, []))
+            draw_plot(window["-PLOT-"], ys)
+
+    def parse_limits():
+        lsl_txt = window["-LSL-"].get().strip()
+        usl_txt = window["-USL-"].get().strip()
+        lsl = try_float(lsl_txt) if lsl_txt != "" else None
+        usl = try_float(usl_txt) if usl_txt != "" else None
+        return lsl, usl
+
+    def add_from_input():
+        product = window["-PRODUCT-"].get().strip() or "(line)"
+        param   = window["-PARAM-"].get().strip()
+        if not param:
+            sg.popup_error("Param header is required.", keep_on_top=True); return
+        lsl, usl = parse_limits()
+        sheet = window["-SHEET-"].get().strip()
+
+        raw = window["-FILE-"].get().strip()
+        if not raw:
+            sg.popup_no_wait("No file selected.", keep_on_top=True); return
+        parts = [p.strip() for chunk in raw.split("\n") for p in chunk.split(";") if p.strip()]
+
+        added = 0
+        for p in parts:
+            spec = Spec(product=product, param=param, lsl=lsl, usl=usl)
+            if mon.add(p, sheet if sheet else "", spec):
+                # seed initial LSL/USL into visible state for the row
+                key = (str(Path(p)), sheet if sheet else "", product, param)
+                # create a placeholder so table shows LSL/USL immediately
+                latest_state[key] = {"lsl": lsl, "usl": usl, "status": "Added", "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+                added += 1
+        if added:
+            sg.popup_no_wait(f"Added {added} target(s).", keep_on_top=True)
+
+    try:
+        while True:
+            changed = False
+            for msg in mon.drain():
+                key = (msg["file"], msg["sheet"] if msg["sheet"] != "(first sheet)" else "", msg["product"], msg["param"])
+                # carry LSL/USL for display
+                if key in latest_state:
+                    msg.setdefault("lsl", latest_state[key].get("lsl"))
+                    msg.setdefault("usl", latest_state[key].get("usl"))
+                latest_state[key] = msg
+
+                # history
+                v = msg.get("value", None)
+                if v is not None:
+                    if key not in history:
+                        history[key] = deque(maxlen=HIST_LEN)
+                    history[key].append(float(v))
+                changed = True
+
+            if changed:
+                rebuild_table()
+                if selected_key:
+                    draw_plot(window["-PLOT-"], list(history.get(selected_key, [])))
+
+            event, values = window.read(timeout=200)
+            if event in (sg.WINDOW_CLOSED, "Exit"):
+                break
+
+            if event == "-APPLY-":
+                try:
+                    mon.apply_policy(int(values["-INTERVAL-"]), int(values["-STALL-"]))
+                    sg.popup_no_wait("Updated polling policy.", keep_on_top=True)
+                except Exception:
+                    sg.popup_error("Invalid numbers for interval/threshold.", keep_on_top=True)
+
+            if event == "-ADD-":
+                add_from_input()
+
+            if event == "-TABLE-":
+                sel = values["-TABLE-"]
+                if sel:
+                    idx = sel[0]
+                    selected_key = rows_map.get(idx)
+                    draw_plot(window["-PLOT-"], list(history.get(selected_key, [])))
+
+            # Ensure click also selects the row everywhere
+            if isinstance(event, tuple) and len(event) == 3 and event[0] == "-TABLE-" and event[1] == "+CLICKED+":
+                row, col = event[2]
+                if row is not None and row >= 0:
+                    window["-TABLE-"].update(select_rows=[row])
+                    selected_key = rows_map.get(row)
+                    draw_plot(window["-PLOT-"], list(history.get(selected_key, [])))
+
+            if event == "-REMOVE-":
+                sel = values["-TABLE-"] or []
+                if not sel:
+                    sg.popup_no_wait("No rows selected.", keep_on_top=True)
+                else:
+                    for idx in sorted(sel, reverse=True):
+                        key = rows_map.get(idx)
+                        if key:
+                            mon.remove(key)
+                            latest_state.pop(key, None)
+                            history.pop(key, None)
+                            if selected_key == key: selected_key = None
+                    rebuild_table()
+                    draw_plot(window["-PLOT-"], [])
+
+    finally:
+        # stop workers
+        for w in list(mon._workers.values()):
+            w.stop()
+        window.close()
+
+
+if __name__ == "__main__":
+    main()
