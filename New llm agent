@@ -1,0 +1,72 @@
+# llm_tool_demo.py
+from openai import OpenAI
+import json
+
+client = OpenAI()  # Uses your OPENAI_API_KEY environment variable
+
+# --- Two "tools" the LLM can choose from ---
+def use_string(text: str):
+    return f"STRING TOOL USED: reversed = '{text[::-1]}'"
+
+def use_number(num: float):
+    return f"NUMBER TOOL USED: squared = {num ** 2}"
+
+# --- The orchestrator ---
+def run_agent(user_input: str):
+    print(f"\nUser entered: {user_input}")
+
+    # The LLM prompt
+    system_prompt = """
+    You are a decision-making agent with two possible actions:
+    1. "use_string" → when the user input is not purely numeric.
+    2. "use_number" → when the user input is a valid integer or float.
+    Reply STRICTLY in JSON with this format:
+    {
+      "action": "use_string" or "use_number",
+      "args": { "text" or "num": ... }
+    }
+    No other text or explanation.
+    """
+
+    # Ask the LLM which tool to use
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",  # can use gpt-3.5-turbo if cheaper
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_input}
+        ],
+        temperature=0  # deterministic
+    )
+
+    llm_reply = response.choices[0].message.content.strip()
+    print("LLM reply:", llm_reply)
+
+    # Parse the LLM’s JSON reply
+    try:
+        plan = json.loads(llm_reply)
+    except json.JSONDecodeError:
+        print("❌ LLM output was not valid JSON!")
+        return
+
+    action = plan.get("action")
+    args = plan.get("args", {})
+
+    # Execute the correct tool
+    if action == "use_number":
+        result = use_number(**args)
+    elif action == "use_string":
+        result = use_string(**args)
+    else:
+        result = f"❌ Unknown action: {action}"
+
+    print("System output:", result)
+
+
+# --- Run the demo loop ---
+if __name__ == "__main__":
+    print("Simple LLM Tool Demo — type something (or 'q' to quit)\n")
+    while True:
+        user_input = input("Your input: ").strip()
+        if user_input.lower() == "q":
+            break
+        run_agent(user_input)
