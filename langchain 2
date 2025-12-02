@@ -1,0 +1,48 @@
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.outputs import ChatResult, ChatGeneration
+from typing import List, Optional, Any
+
+class CompanyChatModel(BaseChatModel):
+    def __init__(self, llm_session: CompanyLLMSession, **kwargs):
+        super().__init__(**kwargs)
+        self.llm_session = llm_session
+
+    @property
+    def _llm_type(self):
+        return "company-web-llm"
+
+    def _generate(
+        self,
+        messages: List[Any],
+        stop: Optional[List[str]] = None,
+        run_manager=None,
+        **kwargs
+    ):
+        # Convert LangChain messages → simple format for your internal API
+        formatted = []
+        for m in messages:
+            role = (
+                "user" if isinstance(m, HumanMessage)
+                else "assistant" if isinstance(m, AIMessage)
+                else "system"
+            )
+            formatted.append({"role": role, "content": m.content})
+
+        # Send to company LLM through session
+        data = self.llm_session.chat(formatted)
+
+        # ⚠️ depends on your actual response JSON
+        text_output = data.get("output") or data.get("answer") or str(data)
+
+        if stop:
+            for s in stop:
+                if s in text_output:
+                    text_output = text_output.split(s)[0]
+
+        ai_msg = AIMessage(content=text_output)
+
+        return ChatResult(
+            generations=[ChatGeneration(message=ai_msg)],
+            llm_output=data,
+        )
