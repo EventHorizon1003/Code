@@ -1,0 +1,40 @@
+import requests
+
+class CompanyLLMSession:
+    def __init__(self):
+        self.session = requests.Session()
+        self.is_logged_in = False
+
+    def login(self, username: str, password: str):
+        login_url = "https://internal.company.com/login"
+
+        payload = {
+            "username": username,
+            "password": password,
+        }
+
+        # POST login form
+        resp = self.session.post(login_url, data=payload)
+        resp.raise_for_status()
+
+        # Your company login page might redirect — check the result
+        if "Logout" in resp.text or resp.status_code == 200:
+            self.is_logged_in = True
+        else:
+            raise Exception("Login failed — check fields or cookies")
+
+    def chat(self, messages):
+        if not self.is_logged_in:
+            raise Exception("Not logged in!")
+
+        chat_url = "https://internal.company.com/api/chat"
+
+        payload = {
+            "messages": messages  # depends on real schema
+        }
+
+        # Session maintains cookies automatically here
+        resp = self.session.post(chat_url, json=payload)
+        resp.raise_for_status()
+
+        return resp.json()  # adapt to your API
