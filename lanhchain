@@ -1,0 +1,129 @@
+# company_chat_model.py
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+import os
+import requests
+from pydantic import BaseModel, Field
+
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import (
+    BaseMessage,
+    HumanMessage,
+    AIMessage,
+    SystemMessage,
+)
+from langchain_core.outputs import ChatResult, ChatGeneration
+from langchain_core.callbacks import CallbackManagerForLLMRun
+
+
+class CompanyChatModel(BaseChatModel, BaseModel):
+    """
+    LangChain wrapper for your internal company chat model.
+
+    You MUST adapt:
+      - base_url
+      - auth (headers / cookies)
+      - request/response JSON shape
+    """
+
+    base_url: str = Field(
+        default="https://llm.company.com/api/chat",
+        description="Internal LLM HTTP endpoint",
+    )
+    # example: bearer token or session cookie from env
+    auth_token: Optional[str] = Field(
+        default=os.getenv("COMPANY_LLM_TOKEN"),
+        description="Auth token or session value (optional)",
+    )
+    timeout: int = 60
+
+    model_name: str = "company-llm"   # just for logging/tracking
+    temperature: float = 0.0
+
+    # ---- Required by LangChain ----
+
+    @property
+    def _llm_type(self) -> str:
+        # just an identifier for debugging
+        return "company-chat-model"
+
+    @property
+    def _identifying_params(self) -> Dict[str, Any]:
+        # used for caching / tracing
+        return {
+            "base_url": self.base_url,
+            "model_name": self.model_name,
+            "temperature": self.temperature,
+        }
+
+    # ---- Helper: convert LangChain messages -> API messages ----
+
+    def _format_message(self, msg: BaseMessage) -> Dict[str, Any]:
+        if isinstance(msg, HumanMessage):
+            role = "user"
+        elif isinstance(msg, AIMessage):
+            role = "assistant"
+        elif isinstance(msg, SystemMessage):
+            role = "system"
+        else:
+            # you can add more roles if your API supports them
+            role = msg.type
+
+        return {
+            "role": role,
+            "content": msg.content,
+        }
+
+    def _build_payload(self, messages: List[BaseMessage]) -> Dict[str, Any]:
+        return {
+            "model": self.model_name,
+            "temperature": self.temperature,
+            "messages": [self._format_message(m) for m in messages],
+        }
+
+    def _build_headers(self) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.auth_token:
+            # could also be Cookie, custom header, etc.
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+        return headers
+
+    # ---- Core: call your company endpoint and return ChatResult ----
+
+    def _generate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        payload = self._build_payload(messages)
+        headers = self._build_headers()
+
+        resp = requests.post(
+            self.base_url,
+            json=payload,
+            headers=headers,
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # ⚠️ ADAPT THIS to your actual response structure
+        # e.g. maybe data["choices"][0]["message"]["content"]
+        text = data.get("output") or data.get("answer") or str(data)
+
+        # Apply manual stop tokens if needed
+        if stop:
+            for s in stop:
+                if s in text:
+                    text = text.split(s)[0]
+
+        ai_msg = AIMessage(content=text)
+
+        return ChatResult(
+            generations=[ChatGeneration(message=ai_msg)],
+            llm_output={"raw_response": data},
+        )
