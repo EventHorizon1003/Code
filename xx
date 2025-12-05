@@ -1,0 +1,244 @@
+"""
+Example: use company LLM (login/session) with LangChain tools via ReAct agent.
+
+pip install:
+    langchain==1.1.*
+    langchain-core
+    requests
+    certifi
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Dict, List, Optional
+
+import certifi
+import requests
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+)
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import tool
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.agents import create_react_agent, AgentExecutor
+
+
+# =========================
+# 1. Custom LLM wrapper
+# =========================
+
+class CustomLLM(BaseChatModel):
+    """
+    Wraps your company LLM which requires login/session.
+    This class is used like any LangChain ChatModel.
+    """
+
+    model_name: str = "aide-gpt-4.1"
+    base_url: str
+    username: str
+    password: str
+
+    # ---- required by BaseChatModel ----
+    @property
+    def _llm_type(self) -> str:
+        return "company_custom_llm"
+
+    def _generate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """
+        Core method: converts LangChain messages -> HTTP request,
+        then converts HTTP response -> AIMessage.
+        """
+
+        login_url = f"{self.base_url}/api/login"
+        chat_url = f"{self.base_url}/api/chat2"
+        logout_url = f"{self.base_url}/api/logout"
+
+        credentials = {
+            "username": self.username,
+            "password": str(self.password),
+        }
+
+        # Convert LangChain messages to simple OpenAI-style messages
+        http_messages: List[Dict[str, Any]] = []
+        for m in messages:
+            if isinstance(m, HumanMessage):
+                http_messages.append({"role": "user", "content": m.content})
+            elif isinstance(m, SystemMessage):
+                http_messages.append({"role": "system", "content": m.content})
+            else:
+                # assistant / tool / others – keep as assistant text for now
+                http_messages.append({"role": "assistant", "content": m.content})
+
+        # For convenience, last user message as "prompt" (your backend seems to want this)
+        last_user_text = ""
+        for m in reversed(http_messages):
+            if m["role"] == "user":
+                last_user_text = m["content"]
+                break
+
+        chat_data: Dict[str, Any] = {
+            "model": {
+                "id": self.model_name,
+                "name": "GPT-5",         # whatever your backend expects
+                "desc": "",
+                "maxLength": 96000,
+                "tokenLimit": 16000,
+                "endPointType": "openai",
+                "tokenCounter": "gpt",
+            },
+            "messages": http_messages,
+            "key": "",
+            "prompt": last_user_text,
+            "temperature": 0.3,
+            "organic": True,
+        }
+
+        with requests.Session() as session:
+            # ---- Login ----
+            login_resp = session.post(
+                login_url,
+                json=credentials,
+                verify=certifi.where(),
+            )
+            if login_resp.status_code != 200:
+                # Return some error message as AIMessage
+                ai_msg = AIMessage(
+                    content=f"Login failed: {login_resp.status_code} {login_resp.text}"
+                )
+                return ChatResult(generations=[ChatGeneration(message=ai_msg)])
+
+            # ---- Chat ----
+            chat_resp = session.post(
+                chat_url,
+                json=chat_data,
+                verify=certifi.where(),
+            )
+
+            # ---- Logout (fire and forget) ----
+            try:
+                session.get(logout_url, verify=certifi.where())
+            except Exception:
+                pass
+
+        # ---- Parse response body ----
+        if chat_resp.status_code != 200:
+            content = f"Chat failed: {chat_resp.status_code} {chat_resp.text}"
+        else:
+            # Try JSON first, fall back to raw text
+            try:
+                data = chat_resp.json()
+
+                # Adjust this part to match your real backend JSON
+                # Example patterns:
+                #   {"text": "..."}
+                #   {"message": "..."}
+                #   {"choices": [{"message": {"content": "..."}}]}
+                if isinstance(data, dict):
+                    if "text" in data:
+                        content = data["text"]
+                    elif "message" in data and isinstance(data["message"], dict):
+                        content = data["message"].get("content", str(data["message"]))
+                    elif "choices" in data:
+                        content = data["choices"][0]["message"]["content"]
+                    else:
+                        content = json.dumps(data)
+                else:
+                    content = json.dumps(data)
+            except ValueError:
+                # Not JSON, treat as plain text
+                content = chat_resp.text
+
+        ai_msg = AIMessage(content=content)
+        return ChatResult(generations=[ChatGeneration(message=ai_msg)])
+
+
+# =========================
+# 2. Define tools
+# =========================
+
+@tool
+def test_time_saving(old_time_s: float, new_time_s: float) -> float:
+    """Percentage reduction in test time from old_time_s to new_time_s."""
+    return (old_time_s - new_time_s) / old_time_s * 100.0
+
+
+TOOLS = [test_time_saving]
+
+
+# =========================
+# 3. Build ReAct agent
+# =========================
+
+def build_ate_agent(llm: CustomLLM) -> AgentExecutor:
+    """
+    Create a ReAct-style agent using our CustomLLM + tools.
+    Tools are executed locally by LangChain; company LLM just reasons in text.
+    """
+
+    tool_descriptions = "\n".join(
+        f"- {t.name}: {t.description}" for t in TOOLS
+    )
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                (
+                    "You are an RF/ATE test assistant. "
+                    "You can use Python tools to do calculations.\n\n"
+                    "TOOLS:\n"
+                    f"{tool_descriptions}\n\n"
+                    "Use the following ReAct format:\n"
+                    "Thought: think about what to do\n"
+                    "Action: tool_name\n"
+                    "Action Input: JSON with arguments\n"
+                    "Observation: tool result\n"
+                    "…repeat as needed…\n"
+                    "Final Answer: your final answer to the user.\n"
+                ),
+            ),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+            MessagesPlaceholder("agent_scratchpad"),
+        ]
+    )
+
+    agent = create_react_agent(llm, TOOLS, prompt)
+    executor = AgentExecutor(agent=agent, tools=TOOLS, verbose=True)
+    return executor
+
+
+# =========================
+# 4. Example usage
+# =========================
+
+if __name__ == "__main__":
+    BASE_URL = "https://your-company-llm-host"  # <<< CHANGE THIS
+    USERNAME = "your_username"                  # <<< CHANGE THIS
+    PASSWORD = "your_password"                  # <<< CHANGE THIS
+
+    llm = CustomLLM(
+        base_url=BASE_URL,
+        username=USERNAME,
+        password=PASSWORD,
+    )
+
+    agent = build_ate_agent(llm)
+
+    # Simple test query that should trigger the test_time_saving tool
+    question = "Previously final test time was 20 seconds, now it is 12 seconds. " \
+               "What is the percentage test time saving? Explain briefly."
+
+    result = agent.invoke({"input": question})
+    print("\n=== AGENT OUTPUT ===")
+    print(result["output"])
