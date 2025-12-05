@@ -1,0 +1,140 @@
+from __future__ import annotations
+
+import json
+from typing import Any, Dict, List, Optional
+import requests, certifi
+
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import (
+    AIMessage, HumanMessage, SystemMessage, BaseMessage
+)
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.callbacks import (
+    CallbackManagerForLLMRun,
+    AsyncCallbackManagerForLLMRun,
+)
+
+
+class CustomLLM(BaseChatModel):
+    """
+    Custom chat model + manual bind_tools implementation.
+    """
+
+    base_url: str
+    username: str
+    password: str
+    model_name: str = "aide-gpt-4.1"
+
+    # internal storage for tools when user calls bind_tools()
+    bound_tools: Optional[List[Dict[str, Any]]] = None
+    bound_tool_choice: Optional[str] = None
+
+    # ---------------------
+    # REQUIRED by BaseChatModel
+    # ---------------------
+    @property
+    def _llm_type(self) -> str:
+        return "company_custom_llm"
+
+    # ---------------------
+    # ADD bind_tools YOURSELF
+    # ---------------------
+    def bind_tools(self, tools: List[Any], tool_choice: Optional[str] = None):
+        """
+        Store tools inside a new cloned instance, same as OpenAI models do.
+        """
+        # Convert LC tools -> JSON schema for OpenAI tool calling
+        converted = []
+        for t in tools:
+            converted.append(t.to_openai_tool())  # LangChain provides this
+
+        new = self.copy()
+        new.bound_tools = converted
+        new.bound_tool_choice = tool_choice or "auto"
+        return new
+
+    # ---------------------
+    # SYNC GENERATE
+    # ---------------------
+    def _generate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+
+        # tools from bind_tools() OR from agent
+        tools = kwargs.get("tools", self.bound_tools)
+        tool_choice = kwargs.get("tool_choice", self.bound_tool_choice)
+
+        login_url = f"{self.base_url}/api/login"
+        chat_url = f"{self.base_url}/api/chat2"
+        logout_url = f"{self.base_url}/api/logout"
+
+        # Convert LC messages → OpenAI-style messages
+        http_messages = []
+        for m in messages:
+            if isinstance(m, HumanMessage):
+                http_messages.append({"role": "user", "content": m.content})
+            elif isinstance(m, SystemMessage):
+                http_messages.append({"role": "system", "content": m.content})
+            elif isinstance(m, AIMessage):
+                d = {"role": "assistant", "content": m.content}
+                if m.tool_calls:
+                    d["tool_calls"] = m.tool_calls
+                http_messages.append(d)
+
+        # Last user msg is your backend's required "prompt"
+        last_user = ""
+        for mm in reversed(http_messages):
+            if mm["role"] == "user":
+                last_user = mm["content"]
+                break
+
+        payload = {
+            "model": {"id": self.model_name, "endPointType": "openai"},
+            "messages": http_messages,
+            "prompt": last_user,
+            "temperature": 0.3,
+        }
+
+        # Attach tools if defined
+        if tools:
+            payload["tools"] = tools
+        if tool_choice:
+            payload["tool_choice"] = tool_choice
+
+        with requests.Session() as s:
+            s.post(login_url, json={"username": self.username, "password": self.password})
+            r = s.post(chat_url, json=payload)
+            try:
+                s.get(logout_url)
+            except:
+                pass
+
+        # Parse reply
+        try:
+            data = r.json()
+        except:
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content=r.text))])
+
+        if "choices" in data:
+            m = data["choices"][0]["message"]
+            msg = AIMessage(content=m.get("content", ""), tool_calls=m.get("tool_calls"))
+        else:
+            msg = AIMessage(content=json.dumps(data))
+
+        return ChatResult(generations=[ChatGeneration(message=msg)])
+
+    # ---------------------
+    # ASYNC stub
+    # ---------------------
+    async def _agenerate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        return self._generate(messages, stop=stop, **kwargs)
