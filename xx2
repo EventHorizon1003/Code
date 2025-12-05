@@ -2,22 +2,42 @@ from __future__ import annotations
 
 import json
 from typing import Any, Dict, List, Optional
-import requests, certifi
 
+import certifi
+import requests
+
+# LangChain Core
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
-    AIMessage, HumanMessage, SystemMessage, BaseMessage
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
 )
-from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.outputs import ChatResult, ChatGeneration
 from langchain_core.callbacks import (
     CallbackManagerForLLMRun,
     AsyncCallbackManagerForLLMRun,
 )
 
+# Tools + Agent
+from langchain_core.tools import tool
+from langchain.agents import create_agent
+
+
+# =====================================================================
+# 1. CUSTOM LLM (company website wrapper)
+# =====================================================================
 
 class CustomLLM(BaseChatModel):
     """
-    Custom chat model + manual bind_tools implementation.
+    Your company LLM wrapper:
+        - login
+        - send prompt
+        - receive text
+        - logout
+    Does NOT support tools. Only pure text in/out.
+    The Agent system handles tools locally in Python.
     """
 
     base_url: str
@@ -25,54 +45,24 @@ class CustomLLM(BaseChatModel):
     password: str
     model_name: str = "aide-gpt-4.1"
 
-    # internal storage for tools when user calls bind_tools()
-    bound_tools: Optional[List[Dict[str, Any]]] = None
-    bound_tool_choice: Optional[str] = None
-
-    # ---------------------
-    # REQUIRED by BaseChatModel
-    # ---------------------
     @property
     def _llm_type(self) -> str:
-        return "company_custom_llm"
+        return "company_llm"
 
-    # ---------------------
-    # ADD bind_tools YOURSELF
-    # ---------------------
-    def bind_tools(self, tools: List[Any], tool_choice: Optional[str] = None):
-        """
-        Store tools inside a new cloned instance, same as OpenAI models do.
-        """
-        # Convert LC tools -> JSON schema for OpenAI tool calling
-        converted = []
-        for t in tools:
-            converted.append(t.to_openai_tool())  # LangChain provides this
-
-        new = self.copy()
-        new.bound_tools = converted
-        new.bound_tool_choice = tool_choice or "auto"
-        return new
-
-    # ---------------------
-    # SYNC GENERATE
-    # ---------------------
+    # --------- SYNC GENERATE (model.invoke) ----------
     def _generate(
         self,
         messages: List[BaseMessage],
         stop: Optional[List[str]] = None,
         run_manager: Optional[CallbackManagerForLLMRun] = None,
-        **kwargs: Any,
+        **kwargs
     ) -> ChatResult:
-
-        # tools from bind_tools() OR from agent
-        tools = kwargs.get("tools", self.bound_tools)
-        tool_choice = kwargs.get("tool_choice", self.bound_tool_choice)
 
         login_url = f"{self.base_url}/api/login"
         chat_url = f"{self.base_url}/api/chat2"
         logout_url = f"{self.base_url}/api/logout"
 
-        # Convert LC messages → OpenAI-style messages
+        # Convert LangChain messages → company-style
         http_messages = []
         for m in messages:
             if isinstance(m, HumanMessage):
@@ -80,61 +70,143 @@ class CustomLLM(BaseChatModel):
             elif isinstance(m, SystemMessage):
                 http_messages.append({"role": "system", "content": m.content})
             elif isinstance(m, AIMessage):
-                d = {"role": "assistant", "content": m.content}
-                if m.tool_calls:
-                    d["tool_calls"] = m.tool_calls
-                http_messages.append(d)
+                http_messages.append({"role": "assistant", "content": m.content})
+            else:
+                http_messages.append({"role": "assistant", "content": m.content})
 
-        # Last user msg is your backend's required "prompt"
-        last_user = ""
-        for mm in reversed(http_messages):
-            if mm["role"] == "user":
-                last_user = mm["content"]
+        # Last user message is "prompt" for website
+        last_user_text = ""
+        for msg in reversed(http_messages):
+            if msg["role"] == "user":
+                last_user_text = msg["content"]
                 break
 
         payload = {
-            "model": {"id": self.model_name, "endPointType": "openai"},
+            "model": {
+                "id": self.model_name,
+                "name": "GPT-5",
+                "desc": "",
+                "maxLength": 96000,
+                "tokenLimit": 16000,
+                "endPointType": "openai",
+                "tokenCounter": "gpt",
+            },
             "messages": http_messages,
-            "prompt": last_user,
+            "prompt": last_user_text,
+            "key": "",
             "temperature": 0.3,
+            "organic": True,
         }
 
-        # Attach tools if defined
-        if tools:
-            payload["tools"] = tools
-        if tool_choice:
-            payload["tool_choice"] = tool_choice
-
+        # ---- LOGIN → CHAT → LOGOUT ----
         with requests.Session() as s:
-            s.post(login_url, json={"username": self.username, "password": self.password})
-            r = s.post(chat_url, json=payload)
+            login_resp = s.post(login_url, json={"username": self.username, "password": self.password}, verify=certifi.where())
+            if login_resp.status_code != 200:
+                return ChatResult(
+                    generations=[ChatGeneration(message=AIMessage(content="Login failed."))]
+                )
+
+            chat_resp = s.post(chat_url, json=payload, verify=certifi.where())
+
             try:
-                s.get(logout_url)
+                s.get(logout_url, verify=certifi.where())
             except:
                 pass
 
-        # Parse reply
+        # -----------------------
+        # Parse server response
+        # -----------------------
         try:
-            data = r.json()
+            data = chat_resp.json()
         except:
-            return ChatResult(generations=[ChatGeneration(message=AIMessage(content=r.text))])
+            msg = chat_resp.text
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content=msg))])
 
-        if "choices" in data:
-            m = data["choices"][0]["message"]
-            msg = AIMessage(content=m.get("content", ""), tool_calls=m.get("tool_calls"))
+        # Adjust according to your API
+        if isinstance(data, dict) and "choices" in data:
+            content = data["choices"][0]["message"]["content"]
+        elif isinstance(data, dict) and "text" in data:
+            content = data["text"]
         else:
-            msg = AIMessage(content=json.dumps(data))
+            content = json.dumps(data)
 
+        msg = AIMessage(content=content)
         return ChatResult(generations=[ChatGeneration(message=msg)])
 
-    # ---------------------
-    # ASYNC stub
-    # ---------------------
+    # --------- ASYNC STUB REQUIRED ----------
     async def _agenerate(
         self,
         messages: List[BaseMessage],
-        stop: Optional[List[str]] = None,
+        stop=None,
         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
-        **kwargs: Any,
+        **kwargs
     ) -> ChatResult:
         return self._generate(messages, stop=stop, **kwargs)
+
+
+# =====================================================================
+# 2. TOOL (runs locally in Python)
+# =====================================================================
+
+@tool
+def test_time_saving(old_time_s: float, new_time_s: float) -> float:
+    """
+    Calculate time saving percentage.
+    This function is executed LOCALLY, not via the company website.
+    """
+    print("\n🔥 TOOL EXECUTED: test_time_saving() 🔥")
+    return (old_time_s - new_time_s) / old_time_s * 100.0
+
+
+tools = [test_time_saving]
+
+
+# =====================================================================
+# 3. CREATE AGENT (LangChain 1.1)
+# =====================================================================
+
+def build_agent(llm: CustomLLM):
+    system_prompt = (
+        "You are an ATE test assistant.\n"
+        "When calculation is needed, ALWAYS call the appropriate tool.\n"
+        "Do not guess. Use the tool strictly.\n"
+    )
+
+    agent = create_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=system_prompt,
+    )
+
+    return agent
+
+
+# =====================================================================
+# 4. RUN THE AGENT
+# =====================================================================
+
+if __name__ == "__main__":
+    # Replace with your real company LLM URL + login
+    llm = CustomLLM(
+        base_url="https://your-company-llm-host",
+        username="your_username",
+        password="your_password",
+    )
+
+    agent = build_agent(llm)
+
+    # Correct input format for LangChain 1.1 agents
+    result = agent.invoke({
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Old test time is 20 seconds. New test time is 12 seconds. "
+                    "Use tools to compute the savings."
+                )
+            }
+        ]
+    })
+
+    print("\n=== FINAL AGENT OUTPUT ===")
+    print(result)
